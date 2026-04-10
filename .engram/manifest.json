@@ -16,6 +16,14 @@
       "sessions": 2,
       "memories": 5,
       "prompts": 0
+    },
+    {
+      "id": "beb1e96e",
+      "created_by": "Matias Torres",
+      "created_at": "2026-04-10T16:57:30Z",
+      "sessions": 0,
+      "memories": 3,
+      "prompts": 0
     }
   ]
 }

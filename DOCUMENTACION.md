@@ -156,11 +156,16 @@ Schedule (30 min)
 
 ### Acceso a la API de Moodle
 
-- **Autenticación**: POST a `/login/token.php` con `service=moodle_mobile_app`
-- **Funciones disponibles**:
+La REST API clásica de Moodle está **deshabilitada** en esta instancia. Sin embargo, los **Mobile Web Services** sí están habilitados — es un canal separado que usan las apps móviles de Moodle, y funciona con llamadas HTTP normales.
+
+- **Autenticación**: POST a `/login/token.php` con `service=moodle_mobile_app` → devuelve un token
+- **Endpoint**: POST a `/webservice/rest/server.php` con `wstoken={token}` + `wsfunction={función}` → devuelve JSON
+- **Funciones utilizadas**:
   - `mod_forum_get_forums_by_courses` — listar foros del curso
   - `mod_forum_get_forum_discussions` — obtener discusiones de un foro
-- **Función NO disponible**: `mod_forum_add_discussion_post` — por eso se usa HTTP scraping para publicar respuestas
+  - `mod_forum_add_discussion_post` — publicar respuesta en un foro (usada en Workflow 3)
+
+> **Nota**: Todas las llamadas se hacen con nodos HTTP Request de n8n. No se usa ningún nodo nativo de Moodle.
 
 ### Foros Monitoreados
 
@@ -179,7 +184,7 @@ Schedule (30 min)
 ## Workflow 3 — Reply (Publicar Respuesta)
 
 **Trigger**: Telegram Trigger (callback_query)
-**Propósito**: Cuando el tutor presiona "Enviar" en Telegram, publicar la respuesta generada en el foro de Moodle y confirmar la acción.
+**Propósito**: Cuando el tutor presiona "Enviar" en Telegram, publicar la respuesta generada en el foro de Moodle vía Mobile Web Services y confirmar la acción.
 
 ### Flujo de Nodos
 
@@ -189,12 +194,10 @@ Telegram Trigger (callback_query)
     → IF acción === "enviar"
         ├─ YES:
         │   → Extract Respuesta (del texto del mensaje de Telegram)
-        │   → Login Moodle (HTTP Request: POST /login/index.php)
-        │   → Extract Cookies (Set-Cookie headers)
-        │   → Get Discussion Page (HTTP Request: GET /mod/forum/discuss.php?d=DISCUSSION_ID)
-        │   → Extract Sesskey (regex sobre HTML: sesskey=XXXXX)
-        │   → Post Reply (HTTP Request: POST /mod/forum/post.php)
-        │       Body: sesskey, message, discussion, reply (parent post ID)
+        │   → Obtener Token (POST /login/token.php, service=moodle_mobile_app)
+        │   → Post Reply (POST /webservice/rest/server.php)
+        │       wsfunction=mod_forum_add_discussion_post
+        │       postid={parent_post_id}, subject="Re: ...", message={respuesta}
         │   → Edit Telegram Message ("Respuesta enviada al foro")
         │
         └─ NO (ignorar):
@@ -203,39 +206,44 @@ Telegram Trigger (callback_query)
 
 ### Detalle del Flujo de Publicación
 
-El flujo de publicación en Moodle usa **HTTP scraping** porque la función de API `mod_forum_add_discussion_post` no está habilitada en la instancia.
+La publicación usa **Mobile Web Services** de Moodle — el mismo canal que usamos para leer foros y discusiones.
 
-#### Paso 1 — Login con Cookies
+#### Paso 1 — Obtener Token
 
 ```
-POST https://tup.sied.utn.edu.ar/login/index.php
+POST https://tup.sied.utn.edu.ar/login/token.php
 Content-Type: application/x-www-form-urlencoded
 
-username=44662828&password=%25Matyalts135&anchor=
+username=44662828&password=%25Matyalts135&service=moodle_mobile_app
 ```
 
-Se extraen los headers `Set-Cookie` de la respuesta para mantener la sesión autenticada.
+Devuelve `{ "token": "abc123..." }`.
 
-#### Paso 2 — Obtener Sesskey
+> **Nota**: Se puede reutilizar el token si ya fue obtenido en el Workflow 2 (almacenado en static data del workflow o pasado como dato en el callback). Si no, se solicita uno nuevo.
 
-```
-GET https://tup.sied.utn.edu.ar/mod/forum/discuss.php?d={DISCUSSION_ID}
-Cookie: {cookies del paso anterior}
-```
-
-Del HTML de respuesta se extrae el `sesskey` con regex: `"sesskey":"([a-zA-Z0-9]+)"` o del input hidden.
-
-#### Paso 3 — Publicar Respuesta
+#### Paso 2 — Publicar Respuesta
 
 ```
-POST https://tup.sied.utn.edu.ar/mod/forum/post.php
-Cookie: {cookies}
+POST https://tup.sied.utn.edu.ar/webservice/rest/server.php
 Content-Type: application/x-www-form-urlencoded
 
-sesskey={sesskey}&reply={parent_post_id}&discussion={discussion_id}&message[text]={respuesta}&message[format]=1
+wstoken={token}
+&wsfunction=mod_forum_add_discussion_post
+&moodlewsrestformat=json
+&postid={parent_post_id}
+&subject=Re: {subject_original}
+&message={respuesta_generada}
+&messageformat=1
 ```
 
-#### Paso 4 — Confirmación
+| Parámetro | Descripción |
+|---|---|
+| `postid` | ID del post al que se responde (el post original del alumno) |
+| `subject` | Asunto de la respuesta (convención: "Re: " + subject original) |
+| `message` | Texto de la respuesta generada por el LLM |
+| `messageformat` | 1 = HTML, 0 = Moodle auto-format |
+
+#### Paso 3 — Confirmación en Telegram
 
 Se edita el mensaje original de Telegram para reflejar el resultado:
 - Exitoso: "Respuesta publicada en el foro"
@@ -243,10 +251,9 @@ Se edita el mensaje original de Telegram para reflejar el resultado:
 
 ### Notas de Implementación
 
-- **Cookies entre requests**: hay que extraer manualmente los headers `Set-Cookie` y pasarlos como header `Cookie` en cada request siguiente. n8n no maneja sesiones automáticamente.
-- **Telegram callback_data** tiene límite de 64 bytes: la respuesta completa se recupera del texto del mensaje original de Telegram (no cabe en el callback).
-- **Sesskey** es un token CSRF de Moodle, cambia por sesión. Se debe obtener fresh en cada flujo de publicación.
-- El `parent_post_id` se necesita para responder al post correcto dentro de la discusión. Se puede obtener del HTML de la página de discusión.
+- **Telegram callback_data** tiene límite de 64 bytes: la respuesta completa se recupera del texto del mensaje original de Telegram (no cabe en el callback)
+- El `parent_post_id` (ID del post del alumno) debe venir del Workflow 2, ya sea incluido en el callback_data o almacenado en static data del workflow
+- El token de Moodle podría cachearse en static data para evitar un request extra por cada reply
 
 ---
 
@@ -271,13 +278,21 @@ Se eligió **Mistral Embed** (`mistral-embed`, 1024 dims) sobre Gemini por las s
 
 **Lección**: Siempre verificar el dashboard del proveedor de embeddings ANTES de asumir problemas de datos.
 
+### Mobile Web Services vs REST API vs HTTP Scraping
+
+Moodle tiene tres formas de acceso externo:
+
+| Método | Estado en esta instancia | Uso en el proyecto |
+|---|---|---|
+| REST API (protocolo REST) | Deshabilitada | No se usa |
+| Mobile Web Services | Habilitada | Lectura de foros Y publicación de respuestas |
+| HTTP Scraping (cookies + sesskey) | Disponible como fallback | Solo si mobile web services falla para postear |
+
+Los Mobile Web Services son un canal separado de la REST API. Que la REST API esté deshabilitada NO significa que los web services mobile lo estén. Se autentican con token vía `/login/token.php` y devuelven JSON limpio.
+
 ### n8n Code Node — Sin fetch()
 
 El Code Node v2 de n8n **no tiene `fetch` disponible** en el sandbox. Todas las llamadas HTTP deben hacerse con nodos HTTP Request, no dentro de Code nodes.
-
-### Manejo de Cookies para Scraping
-
-Para flujos que requieren scraping con cookies (como publicar en Moodle), hay que extraer manualmente los headers `Set-Cookie` de la respuesta y pasarlos como header `Cookie` en los requests siguientes. n8n no tiene manejo automático de sesiones HTTP.
 
 ### Forum CMIDs vs Forum IDs
 
@@ -305,7 +320,7 @@ Los CMIDs en las URLs de Moodle (`view.php?id=X`) son IDs de módulo de curso, N
 - [ ] Completar ingesta de PDFs en Pinecone con Mistral Embed
 - [ ] Integración de RAG query en Workflow 2 (embed pregunta + query Pinecone + Gemini LLM)
 - [ ] Inline keyboard en Telegram ("Enviar" / "Ignorar") en Workflow 2
-- [ ] Workflow 3 (Reply) — Login + sesskey + POST para publicar en Moodle
+- [ ] Workflow 3 (Reply) — Publicar respuesta vía Mobile Web Services (`mod_forum_add_discussion_post`)
 - [ ] Confirmación en Telegram post-publicación
 - [ ] Monitoreo de foros de unidades 6-10
 
