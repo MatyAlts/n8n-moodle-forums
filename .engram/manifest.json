@@ -8,6 +8,14 @@
       "sessions": 1,
       "memories": 4,
       "prompts": 0
+    },
+    {
+      "id": "11d7bb23",
+      "created_by": "Matias Torres",
+      "created_at": "2026-04-10T15:42:59Z",
+      "sessions": 2,
+      "memories": 5,
+      "prompts": 0
     }
   ]
 }
